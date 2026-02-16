@@ -62,10 +62,60 @@ class UserRole:
     FINANCE = "finance"
     PROCUREMENT = "procurement"
 
+# ==================== RBAC MODELS ====================
+
+# Available modules for permission assignment
+AVAILABLE_MODULES = [
+    "dashboard",
+    "projects", 
+    "financial",
+    "procurement",
+    "hrms",
+    "compliance",
+    "einvoicing",
+    "reports",
+    "ai_assistant",
+    "settings",
+    "admin"
+]
+
+# Available actions per module
+AVAILABLE_ACTIONS = ["view", "create", "edit", "delete"]
+
+class ModulePermission(BaseModel):
+    module: str
+    view: bool = False
+    create: bool = False
+    edit: bool = False
+    delete: bool = False
+
+class RoleCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    permissions: List[ModulePermission] = []
+
+class RoleUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    permissions: Optional[List[ModulePermission]] = None
+    is_active: Optional[bool] = None
+
+class Role(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    description: Optional[str] = None
+    permissions: List[Dict] = []
+    is_system_role: bool = False  # System roles cannot be deleted
+    is_active: bool = True
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
 class UserBase(BaseModel):
     email: EmailStr
     name: str
-    role: str = UserRole.SITE_ENGINEER
+    role: str = UserRole.SITE_ENGINEER  # Legacy field for backwards compatibility
+    role_id: Optional[str] = None  # New RBAC role reference
     phone: Optional[str] = None
     department: Optional[str] = None
 
@@ -76,16 +126,24 @@ class UserLogin(BaseModel):
     email: EmailStr
     password: str
 
+class UserRoleAssignment(BaseModel):
+    user_id: str
+    role_id: str
+
 class User(UserBase):
     model_config = ConfigDict(extra="ignore")
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     is_active: bool = True
 
+class UserWithPermissions(User):
+    permissions: Dict[str, Dict[str, bool]] = {}
+    role_name: Optional[str] = None
+
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
-    user: User
+    user: UserWithPermissions
 
 # Project Models
 class ProjectStatus:
@@ -539,6 +597,56 @@ def create_access_token(data: dict) -> str:
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
+async def get_user_permissions(user_doc: dict) -> Dict[str, Dict[str, bool]]:
+    """Get user permissions based on their assigned role"""
+    permissions = {}
+    
+    # Initialize all modules with no permissions
+    for module in AVAILABLE_MODULES:
+        permissions[module] = {"view": False, "create": False, "edit": False, "delete": False}
+    
+    # Check for RBAC role_id first
+    if user_doc.get("role_id"):
+        role_doc = await db.roles.find_one({"id": user_doc["role_id"], "is_active": True}, {"_id": 0})
+        if role_doc:
+            for perm in role_doc.get("permissions", []):
+                module = perm.get("module")
+                if module in permissions:
+                    permissions[module] = {
+                        "view": perm.get("view", False),
+                        "create": perm.get("create", False),
+                        "edit": perm.get("edit", False),
+                        "delete": perm.get("delete", False)
+                    }
+            return permissions
+    
+    # Fallback to legacy role-based permissions
+    legacy_role = user_doc.get("role", "site_engineer")
+    
+    # Admin has full access
+    if legacy_role == "admin":
+        for module in AVAILABLE_MODULES:
+            permissions[module] = {"view": True, "create": True, "edit": True, "delete": True}
+    elif legacy_role == "site_engineer":
+        permissions["dashboard"] = {"view": True, "create": False, "edit": False, "delete": False}
+        permissions["projects"] = {"view": True, "create": True, "edit": True, "delete": False}
+        permissions["reports"] = {"view": True, "create": False, "edit": False, "delete": False}
+        permissions["ai_assistant"] = {"view": True, "create": True, "edit": False, "delete": False}
+    elif legacy_role == "finance":
+        permissions["dashboard"] = {"view": True, "create": False, "edit": False, "delete": False}
+        permissions["projects"] = {"view": True, "create": False, "edit": False, "delete": False}
+        permissions["financial"] = {"view": True, "create": True, "edit": True, "delete": True}
+        permissions["compliance"] = {"view": True, "create": True, "edit": True, "delete": True}
+        permissions["einvoicing"] = {"view": True, "create": True, "edit": True, "delete": True}
+        permissions["reports"] = {"view": True, "create": True, "edit": False, "delete": False}
+    elif legacy_role == "procurement":
+        permissions["dashboard"] = {"view": True, "create": False, "edit": False, "delete": False}
+        permissions["projects"] = {"view": True, "create": False, "edit": False, "delete": False}
+        permissions["procurement"] = {"view": True, "create": True, "edit": True, "delete": True}
+        permissions["reports"] = {"view": True, "create": False, "edit": False, "delete": False}
+    
+    return permissions
+
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> User:
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
@@ -554,12 +662,64 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+async def get_current_user_with_permissions(credentials: HTTPAuthorizationCredentials = Depends(security)) -> UserWithPermissions:
+    """Get current user with their permissions"""
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        user_doc = await db.users.find_one({"id": user_id}, {"_id": 0})
+        if user_doc is None:
+            raise HTTPException(status_code=401, detail="User not found")
+        
+        # Get permissions
+        permissions = await get_user_permissions(user_doc)
+        
+        # Get role name if using RBAC
+        role_name = None
+        if user_doc.get("role_id"):
+            role_doc = await db.roles.find_one({"id": user_doc["role_id"]}, {"_id": 0, "name": 1})
+            if role_doc:
+                role_name = role_doc.get("name")
+        
+        user_data = {k: v for k, v in user_doc.items() if k not in ['_id', 'password']}
+        return UserWithPermissions(**user_data, permissions=permissions, role_name=role_name)
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
 def check_role(allowed_roles: List[str]):
+    """Legacy role check decorator"""
     async def role_checker(current_user: User = Depends(get_current_user)) -> User:
         if current_user.role not in allowed_roles:
             raise HTTPException(status_code=403, detail="Insufficient permissions")
         return current_user
     return role_checker
+
+def require_permission(module: str, action: str):
+    """RBAC permission check decorator"""
+    async def permission_checker(credentials: HTTPAuthorizationCredentials = Depends(security)) -> UserWithPermissions:
+        user = await get_current_user_with_permissions(credentials)
+        
+        # Check if user has required permission
+        if module not in user.permissions:
+            raise HTTPException(status_code=403, detail=f"Access to {module} denied")
+        
+        if not user.permissions[module].get(action, False):
+            raise HTTPException(status_code=403, detail=f"Insufficient permissions: {action} on {module} denied")
+        
+        return user
+    return permission_checker
+
+def require_admin():
+    """Decorator to require admin role"""
+    async def admin_checker(current_user: User = Depends(get_current_user)) -> User:
+        if current_user.role != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+        return current_user
+    return admin_checker
 
 # ==================== AUTH ROUTES ====================
 
@@ -576,8 +736,12 @@ async def register(user_data: UserCreate):
     doc = {**user_obj.model_dump(), "password": user_dict['password']}
     await db.users.insert_one(doc)
     
+    # Get user permissions for token response
+    permissions = await get_user_permissions(doc)
+    user_with_perms = UserWithPermissions(**user_obj.model_dump(), permissions=permissions)
+    
     access_token = create_access_token({"sub": user_obj.id, "role": user_obj.role})
-    return Token(access_token=access_token, user=user_obj)
+    return Token(access_token=access_token, user=user_with_perms)
 
 @api_router.post("/auth/login", response_model=Token)
 async def login(credentials: UserLogin):
@@ -585,13 +749,301 @@ async def login(credentials: UserLogin):
     if not user_doc or not verify_password(credentials.password, user_doc['password']):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
-    user_obj = User(**{k: v for k, v in user_doc.items() if k not in ['_id', 'password']})
-    access_token = create_access_token({"sub": user_obj.id, "role": user_obj.role})
-    return Token(access_token=access_token, user=user_obj)
+    # Get permissions
+    permissions = await get_user_permissions(user_doc)
+    
+    # Get role name if using RBAC
+    role_name = None
+    if user_doc.get("role_id"):
+        role_doc = await db.roles.find_one({"id": user_doc["role_id"]}, {"_id": 0, "name": 1})
+        if role_doc:
+            role_name = role_doc.get("name")
+    
+    user_data = {k: v for k, v in user_doc.items() if k not in ['_id', 'password']}
+    user_with_perms = UserWithPermissions(**user_data, permissions=permissions, role_name=role_name)
+    
+    access_token = create_access_token({"sub": user_with_perms.id, "role": user_with_perms.role})
+    return Token(access_token=access_token, user=user_with_perms)
 
-@api_router.get("/auth/me", response_model=User)
-async def get_me(current_user: User = Depends(get_current_user)):
+@api_router.get("/auth/me", response_model=UserWithPermissions)
+async def get_me(current_user: UserWithPermissions = Depends(get_current_user_with_permissions)):
     return current_user
+
+# ==================== RBAC ROUTES ====================
+
+# Get available modules and actions for admin UI
+@api_router.get("/rbac/modules")
+async def get_available_modules(current_user: User = Depends(require_admin())):
+    return {
+        "modules": AVAILABLE_MODULES,
+        "actions": AVAILABLE_ACTIONS
+    }
+
+# Roles CRUD
+@api_router.post("/rbac/roles", response_model=Role)
+async def create_role(role_data: RoleCreate, current_user: User = Depends(require_admin())):
+    # Check if role name already exists
+    existing = await db.roles.find_one({"name": role_data.name.strip()})
+    if existing:
+        raise HTTPException(status_code=400, detail="Role with this name already exists")
+    
+    # Validate permissions
+    permissions_list = []
+    for perm in role_data.permissions:
+        if perm.module not in AVAILABLE_MODULES:
+            raise HTTPException(status_code=400, detail=f"Invalid module: {perm.module}")
+        permissions_list.append(perm.model_dump())
+    
+    role = Role(
+        name=role_data.name.strip(),
+        description=role_data.description,
+        permissions=permissions_list,
+        is_system_role=False
+    )
+    
+    await db.roles.insert_one(role.model_dump())
+    return role
+
+@api_router.get("/rbac/roles", response_model=List[Role])
+async def list_roles(
+    include_inactive: bool = False,
+    current_user: User = Depends(require_admin())
+):
+    query = {} if include_inactive else {"is_active": True}
+    roles = await db.roles.find(query, {"_id": 0}).to_list(1000)
+    return [Role(**r) for r in roles]
+
+@api_router.get("/rbac/roles/{role_id}", response_model=Role)
+async def get_role(role_id: str, current_user: User = Depends(require_admin())):
+    role = await db.roles.find_one({"id": role_id}, {"_id": 0})
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    return Role(**role)
+
+@api_router.put("/rbac/roles/{role_id}", response_model=Role)
+async def update_role(role_id: str, role_data: RoleUpdate, current_user: User = Depends(require_admin())):
+    role = await db.roles.find_one({"id": role_id}, {"_id": 0})
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    
+    # Don't allow editing system roles completely (only permissions)
+    if role.get("is_system_role") and role_data.name and role_data.name != role.get("name"):
+        raise HTTPException(status_code=400, detail="Cannot rename system roles")
+    
+    update_data = {}
+    if role_data.name is not None:
+        # Check name uniqueness
+        existing = await db.roles.find_one({"name": role_data.name.strip(), "id": {"$ne": role_id}})
+        if existing:
+            raise HTTPException(status_code=400, detail="Role with this name already exists")
+        update_data["name"] = role_data.name.strip()
+    
+    if role_data.description is not None:
+        update_data["description"] = role_data.description
+    
+    if role_data.permissions is not None:
+        permissions_list = []
+        for perm in role_data.permissions:
+            if perm.module not in AVAILABLE_MODULES:
+                raise HTTPException(status_code=400, detail=f"Invalid module: {perm.module}")
+            permissions_list.append(perm.model_dump())
+        update_data["permissions"] = permissions_list
+    
+    if role_data.is_active is not None:
+        if role.get("is_system_role") and not role_data.is_active:
+            raise HTTPException(status_code=400, detail="Cannot deactivate system roles")
+        update_data["is_active"] = role_data.is_active
+    
+    update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    
+    await db.roles.update_one({"id": role_id}, {"$set": update_data})
+    
+    updated_role = await db.roles.find_one({"id": role_id}, {"_id": 0})
+    return Role(**updated_role)
+
+@api_router.delete("/rbac/roles/{role_id}")
+async def delete_role(role_id: str, current_user: User = Depends(require_admin())):
+    role = await db.roles.find_one({"id": role_id}, {"_id": 0})
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    
+    if role.get("is_system_role"):
+        raise HTTPException(status_code=400, detail="Cannot delete system roles")
+    
+    # Check if any users have this role
+    users_with_role = await db.users.count_documents({"role_id": role_id})
+    if users_with_role > 0:
+        raise HTTPException(status_code=400, detail=f"Cannot delete role - {users_with_role} user(s) are assigned to it")
+    
+    await db.roles.delete_one({"id": role_id})
+    return {"message": "Role deleted successfully"}
+
+# User Role Assignment
+@api_router.post("/rbac/assign-role")
+async def assign_role_to_user(assignment: UserRoleAssignment, current_user: User = Depends(require_admin())):
+    # Verify user exists
+    user = await db.users.find_one({"id": assignment.user_id}, {"_id": 0})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Verify role exists and is active
+    role = await db.roles.find_one({"id": assignment.role_id, "is_active": True}, {"_id": 0})
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found or inactive")
+    
+    # Update user with new role
+    await db.users.update_one(
+        {"id": assignment.user_id},
+        {"$set": {"role_id": assignment.role_id}}
+    )
+    
+    return {"message": f"Role '{role['name']}' assigned to user successfully"}
+
+@api_router.delete("/rbac/users/{user_id}/role")
+async def remove_role_from_user(user_id: str, current_user: User = Depends(require_admin())):
+    user = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    await db.users.update_one(
+        {"id": user_id},
+        {"$unset": {"role_id": ""}}
+    )
+    
+    return {"message": "Role removed from user, falling back to legacy role permissions"}
+
+# Get users with their roles for admin management
+@api_router.get("/rbac/users")
+async def list_users_with_roles(current_user: User = Depends(require_admin())):
+    users = await db.users.find({}, {"_id": 0, "password": 0}).to_list(1000)
+    roles = await db.roles.find({}, {"_id": 0}).to_list(1000)
+    roles_map = {r["id"]: r["name"] for r in roles}
+    
+    result = []
+    for u in users:
+        user_data = {
+            "id": u.get("id"),
+            "email": u.get("email"),
+            "name": u.get("name"),
+            "role": u.get("role"),  # Legacy role
+            "role_id": u.get("role_id"),
+            "role_name": roles_map.get(u.get("role_id"), None),
+            "department": u.get("department"),
+            "is_active": u.get("is_active", True),
+            "created_at": u.get("created_at")
+        }
+        result.append(user_data)
+    
+    return result
+
+# Get role statistics for admin dashboard
+@api_router.get("/rbac/stats")
+async def get_rbac_stats(current_user: User = Depends(require_admin())):
+    total_roles = await db.roles.count_documents({})
+    active_roles = await db.roles.count_documents({"is_active": True})
+    total_users = await db.users.count_documents({})
+    users_with_rbac_role = await db.users.count_documents({"role_id": {"$exists": True, "$ne": None}})
+    
+    # Get user count per role
+    pipeline = [
+        {"$match": {"role_id": {"$exists": True, "$ne": None}}},
+        {"$group": {"_id": "$role_id", "count": {"$sum": 1}}}
+    ]
+    role_counts = await db.users.aggregate(pipeline).to_list(1000)
+    
+    roles = await db.roles.find({}, {"_id": 0, "id": 1, "name": 1}).to_list(1000)
+    roles_map = {r["id"]: r["name"] for r in roles}
+    
+    users_per_role = {roles_map.get(rc["_id"], "Unknown"): rc["count"] for rc in role_counts}
+    
+    return {
+        "total_roles": total_roles,
+        "active_roles": active_roles,
+        "total_users": total_users,
+        "users_with_rbac_role": users_with_rbac_role,
+        "users_with_legacy_role": total_users - users_with_rbac_role,
+        "users_per_role": users_per_role
+    }
+
+# Initialize default system roles
+@api_router.post("/rbac/init")
+async def initialize_system_roles(current_user: User = Depends(require_admin())):
+    """Initialize default system roles if they don't exist"""
+    
+    default_roles = [
+        {
+            "name": "Administrator",
+            "description": "Full system access",
+            "is_system_role": True,
+            "permissions": [{"module": m, "view": True, "create": True, "edit": True, "delete": True} for m in AVAILABLE_MODULES]
+        },
+        {
+            "name": "HR Manager",
+            "description": "Human Resources management",
+            "is_system_role": False,
+            "permissions": [
+                {"module": "dashboard", "view": True, "create": False, "edit": False, "delete": False},
+                {"module": "hrms", "view": True, "create": True, "edit": True, "delete": True},
+                {"module": "reports", "view": True, "create": True, "edit": False, "delete": False},
+            ]
+        },
+        {
+            "name": "Project Manager",
+            "description": "Project management and oversight",
+            "is_system_role": False,
+            "permissions": [
+                {"module": "dashboard", "view": True, "create": False, "edit": False, "delete": False},
+                {"module": "projects", "view": True, "create": True, "edit": True, "delete": False},
+                {"module": "procurement", "view": True, "create": False, "edit": False, "delete": False},
+                {"module": "reports", "view": True, "create": True, "edit": False, "delete": False},
+                {"module": "ai_assistant", "view": True, "create": True, "edit": False, "delete": False},
+            ]
+        },
+        {
+            "name": "Accountant",
+            "description": "Financial operations and compliance",
+            "is_system_role": False,
+            "permissions": [
+                {"module": "dashboard", "view": True, "create": False, "edit": False, "delete": False},
+                {"module": "financial", "view": True, "create": True, "edit": True, "delete": False},
+                {"module": "compliance", "view": True, "create": True, "edit": True, "delete": False},
+                {"module": "einvoicing", "view": True, "create": True, "edit": True, "delete": False},
+                {"module": "reports", "view": True, "create": True, "edit": False, "delete": False},
+            ]
+        },
+        {
+            "name": "Site Engineer",
+            "description": "On-site project execution",
+            "is_system_role": False,
+            "permissions": [
+                {"module": "dashboard", "view": True, "create": False, "edit": False, "delete": False},
+                {"module": "projects", "view": True, "create": True, "edit": True, "delete": False},
+                {"module": "reports", "view": True, "create": False, "edit": False, "delete": False},
+                {"module": "ai_assistant", "view": True, "create": True, "edit": False, "delete": False},
+            ]
+        },
+        {
+            "name": "Procurement Officer",
+            "description": "Procurement and vendor management",
+            "is_system_role": False,
+            "permissions": [
+                {"module": "dashboard", "view": True, "create": False, "edit": False, "delete": False},
+                {"module": "procurement", "view": True, "create": True, "edit": True, "delete": True},
+                {"module": "projects", "view": True, "create": False, "edit": False, "delete": False},
+                {"module": "reports", "view": True, "create": False, "edit": False, "delete": False},
+            ]
+        },
+    ]
+    
+    created_count = 0
+    for role_data in default_roles:
+        existing = await db.roles.find_one({"name": role_data["name"]})
+        if not existing:
+            role = Role(**role_data)
+            await db.roles.insert_one(role.model_dump())
+            created_count += 1
+    
+    return {"message": f"Initialized {created_count} system roles", "total_roles": len(default_roles)}
 
 # ==================== DASHBOARD ====================
 

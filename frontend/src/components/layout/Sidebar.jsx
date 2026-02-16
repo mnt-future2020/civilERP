@@ -13,7 +13,8 @@ import {
   X,
   LogOut,
   BarChart3,
-  Receipt
+  Receipt,
+  Shield
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { cn } from '../../lib/utils';
@@ -23,71 +24,100 @@ const navItems = [
     path: '/dashboard', 
     icon: LayoutDashboard, 
     label: 'Dashboard',
+    module: 'dashboard',
     roles: ['admin', 'site_engineer', 'finance', 'procurement']
   },
   { 
     path: '/projects', 
     icon: FolderKanban, 
     label: 'Projects',
+    module: 'projects',
     roles: ['admin', 'site_engineer', 'finance', 'procurement']
   },
   { 
     path: '/financial', 
     icon: IndianRupee, 
     label: 'Financial',
+    module: 'financial',
     roles: ['admin', 'finance']
   },
   { 
     path: '/procurement', 
     icon: ShoppingCart, 
     label: 'Procurement',
+    module: 'procurement',
     roles: ['admin', 'procurement']
   },
   { 
     path: '/hrms', 
     icon: Users, 
     label: 'HRMS',
+    module: 'hrms',
     roles: ['admin']
   },
   { 
     path: '/compliance', 
     icon: FileText, 
     label: 'Compliance',
+    module: 'compliance',
     roles: ['admin', 'finance']
   },
   { 
     path: '/einvoicing', 
     icon: Receipt, 
     label: 'E-Invoicing',
+    module: 'einvoicing',
     roles: ['admin', 'finance']
   },
   { 
     path: '/reports', 
     icon: BarChart3, 
     label: 'Reports',
+    module: 'reports',
     roles: ['admin', 'site_engineer', 'finance', 'procurement']
   },
   { 
     path: '/ai-assistant', 
     icon: Bot, 
     label: 'AI Assistant',
+    module: 'ai_assistant',
     roles: ['admin', 'site_engineer', 'finance', 'procurement']
+  },
+  { 
+    path: '/admin/roles', 
+    icon: Shield, 
+    label: 'Role Management',
+    module: 'admin',
+    roles: ['admin'],
+    adminOnly: true
   },
   { 
     path: '/settings', 
     icon: Settings, 
     label: 'Settings',
+    module: 'settings',
     roles: ['admin']
   },
 ];
 
 export const Sidebar = ({ isOpen, onClose }) => {
   const location = useLocation();
-  const { user, logout } = useAuth();
+  const { user, logout, canView, isAdmin } = useAuth();
   
-  const filteredNavItems = navItems.filter(item => 
-    item.roles.includes(user?.role)
-  );
+  // Filter nav items based on RBAC permissions (with legacy fallback)
+  const filteredNavItems = navItems.filter(item => {
+    // Check if user has RBAC permissions
+    if (user?.permissions && Object.keys(user.permissions).length > 0) {
+      // Admin-only items require admin check
+      if (item.adminOnly) {
+        return isAdmin;
+      }
+      // Check module permission
+      return canView(item.module);
+    }
+    // Fallback to legacy role-based check
+    return item.roles.includes(user?.role);
+  });
 
   return (
     <>

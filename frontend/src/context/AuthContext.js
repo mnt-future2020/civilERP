@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
 import axios from 'axios';
 
 const API_URL = process.env.REACT_APP_BACKEND_URL + '/api';
@@ -35,11 +35,12 @@ export const AuthProvider = ({ children }) => {
           setToken(storedToken);
           setUser(JSON.parse(storedUser));
           
-          // Verify token is still valid
+          // Verify token is still valid and get latest permissions
           const response = await axios.get(`${API_URL}/auth/me`, {
             headers: { Authorization: `Bearer ${storedToken}` }
           });
           setUser(response.data);
+          localStorage.setItem('erp_user', JSON.stringify(response.data));
         } catch (error) {
           console.error('Auth verification failed:', error);
           logout();
@@ -87,6 +88,20 @@ export const AuthProvider = ({ children }) => {
     }
   };
 
+  // Refresh user permissions (useful after role changes)
+  const refreshPermissions = useCallback(async () => {
+    if (!token) return;
+    try {
+      const response = await axios.get(`${API_URL}/auth/me`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setUser(response.data);
+      localStorage.setItem('erp_user', JSON.stringify(response.data));
+    } catch (error) {
+      console.error('Failed to refresh permissions:', error);
+    }
+  }, [token]);
+
   const api = axios.create({
     baseURL: API_URL
   });
@@ -113,6 +128,24 @@ export const AuthProvider = ({ children }) => {
     }
   );
 
+  // Permission checking utilities
+  const permissions = useMemo(() => user?.permissions || {}, [user]);
+
+  const hasPermission = useCallback((module, action) => {
+    if (!permissions[module]) return false;
+    return permissions[module][action] === true;
+  }, [permissions]);
+
+  const canView = useCallback((module) => hasPermission(module, 'view'), [hasPermission]);
+  const canCreate = useCallback((module) => hasPermission(module, 'create'), [hasPermission]);
+  const canEdit = useCallback((module) => hasPermission(module, 'edit'), [hasPermission]);
+  const canDelete = useCallback((module) => hasPermission(module, 'delete'), [hasPermission]);
+
+  // Check if user is admin (either legacy role or has admin module access)
+  const isAdmin = useMemo(() => {
+    return user?.role === 'admin' || hasPermission('admin', 'view');
+  }, [user, hasPermission]);
+
   const value = {
     user,
     token,
@@ -121,7 +154,16 @@ export const AuthProvider = ({ children }) => {
     logout,
     register,
     api,
-    isAuthenticated: !!token && !!user
+    isAuthenticated: !!token && !!user,
+    // RBAC utilities
+    permissions,
+    hasPermission,
+    canView,
+    canCreate,
+    canEdit,
+    canDelete,
+    isAdmin,
+    refreshPermissions
   };
 
   return (

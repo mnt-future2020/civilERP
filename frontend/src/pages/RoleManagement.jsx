@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Shield, Plus, Edit, Trash2, Users, Loader2, Check, X, ChevronDown, ChevronUp, UserCog, RefreshCw } from 'lucide-react';
+import { Shield, Plus, Edit, Trash2, Users, Loader2, Check, X, ChevronDown, ChevronUp, UserCog, RefreshCw, Link2, Unlink, UserPlus, Building2 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../components/ui/card';
 import { Button } from '../components/ui/button';
@@ -45,13 +45,16 @@ export default function RoleManagement() {
   const [stats, setStats] = useState(null);
   const [modules, setModules] = useState([]);
   const [actions, setActions] = useState([]);
+  const [employees, setEmployees] = useState([]);
   
   // Dialog states
   const [roleDialogOpen, setRoleDialogOpen] = useState(false);
   const [assignDialogOpen, setAssignDialogOpen] = useState(false);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [linkEmployeeDialogOpen, setLinkEmployeeDialogOpen] = useState(false);
   const [editingRole, setEditingRole] = useState(null);
   const [selectedUser, setSelectedUser] = useState(null);
+  const [selectedEmployee, setSelectedEmployee] = useState(null);
   const [roleToDelete, setRoleToDelete] = useState(null);
   
   // Form state
@@ -61,6 +64,7 @@ export default function RoleManagement() {
     permissions: {}
   });
   const [selectedRoleId, setSelectedRoleId] = useState('');
+  const [selectedUserId, setSelectedUserId] = useState('');
   const [saving, setSaving] = useState(false);
   const [expandedRole, setExpandedRole] = useState(null);
 
@@ -73,17 +77,19 @@ export default function RoleManagement() {
   const fetchData = async () => {
     setLoading(true);
     try {
-      const [rolesRes, usersRes, statsRes, modulesRes] = await Promise.all([
+      const [rolesRes, usersRes, statsRes, modulesRes, employeesRes] = await Promise.all([
         api.get('/rbac/roles'),
         api.get('/rbac/users'),
         api.get('/rbac/stats'),
-        api.get('/rbac/modules')
+        api.get('/rbac/modules'),
+        api.get('/rbac/employees').catch(() => ({ data: [] }))  // May not exist yet
       ]);
       setRoles(rolesRes.data);
       setUsers(usersRes.data);
       setStats(statsRes.data);
       setModules(modulesRes.data.modules);
       setActions(modulesRes.data.actions);
+      setEmployees(employeesRes.data || []);
     } catch (error) {
       toast.error('Failed to load RBAC data');
       console.error(error);
@@ -247,6 +253,65 @@ export default function RoleManagement() {
     }
   };
 
+  // Employee linking functions
+  const openLinkEmployeeDialog = (employee) => {
+    setSelectedEmployee(employee);
+    setSelectedUserId(employee.user_id || '');
+    setSelectedRoleId(employee.user_data?.role_id || '');
+    setLinkEmployeeDialogOpen(true);
+  };
+
+  const linkEmployeeToUser = async () => {
+    if (!selectedEmployee) return;
+    
+    try {
+      // First link/create user account
+      const linkRes = await api.post(`/employees/${selectedEmployee.id}/link-user`, {
+        employee_id: selectedEmployee.id,
+        user_id: selectedUserId || null  // null = create new user
+      });
+      
+      // If a role is selected and we have a user_id, assign the role
+      if (selectedRoleId && linkRes.data.user_id) {
+        await api.post('/rbac/assign-role', {
+          user_id: linkRes.data.user_id,
+          role_id: selectedRoleId
+        });
+      }
+      
+      toast.success('Employee linked to user account successfully');
+      setLinkEmployeeDialogOpen(false);
+      fetchData();
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Failed to link employee');
+    }
+  };
+
+  const unlinkEmployee = async (employeeId) => {
+    try {
+      await api.delete(`/employees/${employeeId}/unlink-user`);
+      toast.success('Employee unlinked from user account');
+      fetchData();
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Failed to unlink employee');
+    }
+  };
+
+  const assignRoleToEmployee = async (employee) => {
+    if (!employee.user_id) {
+      toast.error('Employee must have a user account first');
+      return;
+    }
+    setSelectedUser({ 
+      id: employee.user_id, 
+      name: employee.name,
+      role: employee.user_data?.role,
+      role_id: employee.user_data?.role_id 
+    });
+    setSelectedRoleId(employee.user_data?.role_id || '');
+    setAssignDialogOpen(true);
+  };
+
   if (!isAdmin) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
@@ -360,6 +425,10 @@ export default function RoleManagement() {
           <TabsTrigger value="users" className="rounded-sm gap-2">
             <Users className="w-4 h-4" />
             User Assignments
+          </TabsTrigger>
+          <TabsTrigger value="employees" className="rounded-sm gap-2">
+            <Building2 className="w-4 h-4" />
+            Employee Access
           </TabsTrigger>
         </TabsList>
 
@@ -504,6 +573,108 @@ export default function RoleManagement() {
             </CardContent>
           </Card>
         </TabsContent>
+
+        {/* Employees Tab */}
+        <TabsContent value="employees">
+          <Card className="rounded-sm">
+            <CardHeader>
+              <CardTitle>Employee Access Management</CardTitle>
+              <CardDescription>
+                Link HRMS employees to user accounts and assign roles. Employees need a user account to log into the system.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {employees.length === 0 ? (
+                <div className="text-center py-8 text-muted-foreground">
+                  <Building2 className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                  <p>No employees found.</p>
+                  <p className="text-sm">Add employees in the HRMS module first, then link them to user accounts here.</p>
+                </div>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Employee Code</TableHead>
+                      <TableHead>Name</TableHead>
+                      <TableHead>Email</TableHead>
+                      <TableHead>Department</TableHead>
+                      <TableHead>User Account</TableHead>
+                      <TableHead>Assigned Role</TableHead>
+                      <TableHead>Actions</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {employees.map((emp) => (
+                      <TableRow key={emp.id}>
+                        <TableCell className="font-mono text-sm">{emp.employee_code}</TableCell>
+                        <TableCell className="font-medium">{emp.name}</TableCell>
+                        <TableCell>{emp.email}</TableCell>
+                        <TableCell>{emp.department || '-'}</TableCell>
+                        <TableCell>
+                          {emp.has_user_account ? (
+                            <Badge className="rounded-sm bg-green-600 gap-1">
+                              <Check className="w-3 h-3" />
+                              Linked
+                            </Badge>
+                          ) : (
+                            <Badge variant="outline" className="rounded-sm text-muted-foreground gap-1">
+                              <X className="w-3 h-3" />
+                              No Account
+                            </Badge>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {emp.user_data?.role_name ? (
+                            <Badge className="rounded-sm bg-blue-600">{emp.user_data.role_name}</Badge>
+                          ) : emp.has_user_account ? (
+                            <span className="text-muted-foreground text-sm">Legacy ({emp.user_data?.role?.replace('_', ' ')})</span>
+                          ) : (
+                            <span className="text-muted-foreground text-sm">-</span>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex gap-1">
+                            {emp.has_user_account ? (
+                              <>
+                                <Button 
+                                  variant="outline" 
+                                  size="sm" 
+                                  onClick={() => assignRoleToEmployee(emp)} 
+                                  className="rounded-sm gap-1"
+                                >
+                                  <UserCog className="w-4 h-4" />
+                                  Role
+                                </Button>
+                                <Button 
+                                  variant="outline" 
+                                  size="sm" 
+                                  onClick={() => unlinkEmployee(emp.id)} 
+                                  className="rounded-sm gap-1 text-red-500 hover:text-red-700"
+                                >
+                                  <Unlink className="w-4 h-4" />
+                                </Button>
+                              </>
+                            ) : (
+                              <Button 
+                                variant="outline" 
+                                size="sm" 
+                                onClick={() => openLinkEmployeeDialog(emp)} 
+                                className="rounded-sm gap-1"
+                              >
+                                <UserPlus className="w-4 h-4" />
+                                Create Account
+                              </Button>
+                            )}
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
       </Tabs>
 
       {/* Create/Edit Role Dialog */}
@@ -618,12 +789,12 @@ export default function RoleManagement() {
           <div className="space-y-4 py-4">
             <div className="space-y-2">
               <Label>Select Role</Label>
-              <Select value={selectedRoleId} onValueChange={setSelectedRoleId}>
+              <Select value={selectedRoleId || "__legacy__"} onValueChange={(val) => setSelectedRoleId(val === "__legacy__" ? "" : val)}>
                 <SelectTrigger className="rounded-sm">
-                  <SelectValue placeholder="Select a role (or leave empty for legacy)" />
+                  <SelectValue placeholder="Select a role" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="">Use Legacy Role ({selectedUser?.role})</SelectItem>
+                  <SelectItem value="__legacy__">Use Legacy Role ({selectedUser?.role?.replace('_', ' ')})</SelectItem>
                   {roles.filter(r => r.is_active).map((role) => (
                     <SelectItem key={role.id} value={role.id}>
                       {role.name}
@@ -632,7 +803,7 @@ export default function RoleManagement() {
                 </SelectContent>
               </Select>
               <p className="text-xs text-muted-foreground">
-                If no role is selected, the user will use their legacy role permissions.
+                If "Use Legacy Role" is selected, the user will use their original role permissions.
               </p>
             </div>
           </div>
@@ -663,6 +834,67 @@ export default function RoleManagement() {
             </Button>
             <Button variant="destructive" onClick={deleteRole} className="rounded-sm">
               Delete Role
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Link Employee to User Account Dialog */}
+      <Dialog open={linkEmployeeDialogOpen} onOpenChange={setLinkEmployeeDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Create User Account for Employee</DialogTitle>
+            <DialogDescription>
+              Create a login account for {selectedEmployee?.name} ({selectedEmployee?.email})
+            </DialogDescription>
+          </DialogHeader>
+          
+          <div className="space-y-4 py-4">
+            <div className="p-4 bg-muted rounded-sm">
+              <p className="text-sm font-medium mb-2">Account Details</p>
+              <div className="grid grid-cols-2 gap-2 text-sm">
+                <div>
+                  <span className="text-muted-foreground">Email:</span>{' '}
+                  <span className="font-mono">{selectedEmployee?.email}</span>
+                </div>
+                <div>
+                  <span className="text-muted-foreground">Default Password:</span>{' '}
+                  <span className="font-mono">Welcome@123</span>
+                </div>
+              </div>
+              <p className="text-xs text-muted-foreground mt-2">
+                The employee should change their password after first login.
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <Label>Assign Role (Optional)</Label>
+              <Select value={selectedRoleId || "__none__"} onValueChange={(val) => setSelectedRoleId(val === "__none__" ? "" : val)}>
+                <SelectTrigger className="rounded-sm">
+                  <SelectValue placeholder="Select a role" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__none__">No Role (use default permissions)</SelectItem>
+                  {roles.filter(r => r.is_active).map((role) => (
+                    <SelectItem key={role.id} value={role.id}>
+                      {role.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                You can also assign a role later from the User Assignments tab.
+              </p>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setLinkEmployeeDialogOpen(false)} className="rounded-sm">
+              Cancel
+            </Button>
+            <Button onClick={linkEmployeeToUser} className="action-btn-accent rounded-sm gap-2">
+              <UserPlus className="w-4 h-4" />
+              Create Account
             </Button>
           </DialogFooter>
         </DialogContent>

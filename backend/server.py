@@ -335,6 +335,8 @@ class EmployeeCreate(BaseModel):
     bank_account: Optional[str] = None
     bank_name: Optional[str] = None
     ifsc: Optional[str] = None
+    user_id: Optional[str] = None  # Link to auth user account
+    create_user_account: bool = False  # Flag to create user account on employee creation
 
 class Employee(EmployeeCreate):
     model_config = ConfigDict(extra="ignore")
@@ -1632,7 +1634,33 @@ async def delete_grn(grn_id: str, current_user: User = Depends(check_role([UserR
 
 @api_router.post("/employees", response_model=Employee)
 async def create_employee(employee_data: EmployeeCreate, current_user: User = Depends(check_role([UserRole.ADMIN]))):
-    employee = Employee(**employee_data.model_dump())
+    emp_dict = employee_data.model_dump()
+    user_id = emp_dict.pop('user_id', None)
+    create_user_account = emp_dict.pop('create_user_account', False)
+    
+    # If create_user_account is True, create a user account with default password
+    if create_user_account and not user_id:
+        # Check if user with this email already exists
+        existing_user = await db.users.find_one({"email": employee_data.email})
+        if existing_user:
+            user_id = existing_user.get("id")
+        else:
+            # Create a new user with default password (employee should change it)
+            default_password = "Welcome@123"
+            new_user = User(
+                email=employee_data.email,
+                name=employee_data.name,
+                role=UserRole.SITE_ENGINEER,  # Default role
+                phone=employee_data.phone,
+                department=employee_data.department
+            )
+            user_doc = {**new_user.model_dump(), "password": get_password_hash(default_password)}
+            await db.users.insert_one(user_doc)
+            user_id = new_user.id
+    
+    # Create employee with optional user_id link
+    emp_dict['user_id'] = user_id
+    employee = Employee(**emp_dict)
     doc = employee.model_dump()
     await db.employees.insert_one(doc)
     return employee
@@ -1693,6 +1721,97 @@ async def deactivate_employee(employee_id: str, current_user: User = Depends(che
         raise HTTPException(status_code=404, detail="Employee not found")
     await db.employees.update_one({"id": employee_id}, {"$set": {"is_active": False}})
     return {"message": "Employee deactivated"}
+
+class LinkEmployeeUser(BaseModel):
+    employee_id: str
+    user_id: Optional[str] = None  # If None, will create new user
+
+@api_router.post("/employees/{employee_id}/link-user")
+async def link_employee_to_user(
+    employee_id: str, 
+    link_data: LinkEmployeeUser,
+    current_user: User = Depends(check_role([UserRole.ADMIN]))
+):
+    """Link an employee to an existing user account or create a new one"""
+    employee = await db.employees.find_one({"id": employee_id}, {"_id": 0})
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    
+    user_id = link_data.user_id
+    
+    if not user_id:
+        # Create a new user account for this employee
+        existing_user = await db.users.find_one({"email": employee["email"]})
+        if existing_user:
+            user_id = existing_user.get("id")
+        else:
+            default_password = "Welcome@123"
+            new_user = User(
+                email=employee["email"],
+                name=employee["name"],
+                role=UserRole.SITE_ENGINEER,
+                phone=employee.get("phone"),
+                department=employee.get("department")
+            )
+            user_doc = {**new_user.model_dump(), "password": get_password_hash(default_password)}
+            await db.users.insert_one(user_doc)
+            user_id = new_user.id
+    else:
+        # Verify user exists
+        user = await db.users.find_one({"id": user_id})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+    
+    await db.employees.update_one({"id": employee_id}, {"$set": {"user_id": user_id}})
+    return {"message": "Employee linked to user account", "user_id": user_id}
+
+@api_router.delete("/employees/{employee_id}/unlink-user")
+async def unlink_employee_from_user(employee_id: str, current_user: User = Depends(check_role([UserRole.ADMIN]))):
+    """Remove the link between an employee and their user account"""
+    employee = await db.employees.find_one({"id": employee_id}, {"_id": 0})
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    
+    await db.employees.update_one({"id": employee_id}, {"$unset": {"user_id": ""}})
+    return {"message": "Employee unlinked from user account"}
+
+@api_router.get("/rbac/employees")
+async def list_employees_with_user_info(current_user: User = Depends(require_admin())):
+    """Get all employees with their linked user and role information for RBAC management"""
+    employees = await db.employees.find({"is_active": True}, {"_id": 0}).to_list(1000)
+    users = await db.users.find({}, {"_id": 0, "password": 0}).to_list(1000)
+    roles = await db.roles.find({}, {"_id": 0}).to_list(1000)
+    
+    users_map = {u["id"]: u for u in users}
+    roles_map = {r["id"]: r["name"] for r in roles}
+    
+    result = []
+    for emp in employees:
+        user_data = None
+        if emp.get("user_id"):
+            user = users_map.get(emp["user_id"])
+            if user:
+                user_data = {
+                    "id": user.get("id"),
+                    "email": user.get("email"),
+                    "role": user.get("role"),
+                    "role_id": user.get("role_id"),
+                    "role_name": roles_map.get(user.get("role_id"))
+                }
+        
+        result.append({
+            "id": emp.get("id"),
+            "name": emp.get("name"),
+            "employee_code": emp.get("employee_code"),
+            "email": emp.get("email"),
+            "department": emp.get("department"),
+            "designation": emp.get("designation"),
+            "user_id": emp.get("user_id"),
+            "user_data": user_data,
+            "has_user_account": emp.get("user_id") is not None
+        })
+    
+    return result
 
 # ==================== ATTENDANCE ROUTES ====================
 

@@ -15,10 +15,11 @@ import AIAssistant from "./pages/AIAssistant";
 import Settings from "./pages/Settings";
 import EInvoicing from "./pages/EInvoicing";
 import ProjectDetail from "./pages/ProjectDetail";
+import RoleManagement from "./pages/RoleManagement";
 
-// Protected Route wrapper
-const ProtectedRoute = ({ children, allowedRoles }) => {
-  const { isAuthenticated, user, loading } = useAuth();
+// Protected Route wrapper with RBAC support
+const ProtectedRoute = ({ children, allowedRoles, module, requireAdmin }) => {
+  const { isAuthenticated, user, loading, canView, isAdmin } = useAuth();
 
   if (loading) {
     return (
@@ -32,7 +33,18 @@ const ProtectedRoute = ({ children, allowedRoles }) => {
     return <Navigate to="/login" replace />;
   }
 
-  if (allowedRoles && !allowedRoles.includes(user?.role)) {
+  // Check admin requirement
+  if (requireAdmin && !isAdmin) {
+    return <Navigate to="/dashboard" replace />;
+  }
+
+  // Check RBAC permission if module is specified
+  if (module && user?.permissions && Object.keys(user.permissions).length > 0) {
+    if (!canView(module)) {
+      return <Navigate to="/dashboard" replace />;
+    }
+  } else if (allowedRoles && !allowedRoles.includes(user?.role)) {
+    // Fallback to legacy role check
     return <Navigate to="/dashboard" replace />;
   }
 
@@ -75,7 +87,7 @@ function AppRoutes() {
       <Route
         path="/dashboard"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute module="dashboard">
             <Dashboard />
           </ProtectedRoute>
         }
@@ -84,7 +96,7 @@ function AppRoutes() {
       <Route
         path="/projects"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute module="projects" allowedRoles={["admin", "site_engineer", "finance", "procurement"]}>
             <Projects />
           </ProtectedRoute>
         }
@@ -93,7 +105,7 @@ function AppRoutes() {
       <Route
         path="/projects/:id"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute module="projects" allowedRoles={["admin", "site_engineer", "finance", "procurement"]}>
             <ProjectDetail />
           </ProtectedRoute>
         }
@@ -102,7 +114,7 @@ function AppRoutes() {
       <Route
         path="/financial"
         element={
-          <ProtectedRoute allowedRoles={["admin", "finance"]}>
+          <ProtectedRoute module="financial" allowedRoles={["admin", "finance"]}>
             <Financial />
           </ProtectedRoute>
         }
@@ -111,7 +123,7 @@ function AppRoutes() {
       <Route
         path="/procurement"
         element={
-          <ProtectedRoute allowedRoles={["admin", "procurement"]}>
+          <ProtectedRoute module="procurement" allowedRoles={["admin", "procurement"]}>
             <Procurement />
           </ProtectedRoute>
         }
@@ -120,7 +132,7 @@ function AppRoutes() {
       <Route
         path="/hrms"
         element={
-          <ProtectedRoute allowedRoles={["admin"]}>
+          <ProtectedRoute module="hrms" allowedRoles={["admin"]}>
             <HRMS />
           </ProtectedRoute>
         }
@@ -129,7 +141,7 @@ function AppRoutes() {
       <Route
         path="/compliance"
         element={
-          <ProtectedRoute allowedRoles={["admin", "finance"]}>
+          <ProtectedRoute module="compliance" allowedRoles={["admin", "finance"]}>
             <Compliance />
           </ProtectedRoute>
         }
@@ -138,7 +150,7 @@ function AppRoutes() {
       <Route
         path="/reports"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute module="reports">
             <Reports />
           </ProtectedRoute>
         }
@@ -147,7 +159,7 @@ function AppRoutes() {
       <Route
         path="/ai-assistant"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute module="ai_assistant">
             <AIAssistant />
           </ProtectedRoute>
         }
@@ -156,7 +168,7 @@ function AppRoutes() {
       <Route
         path="/settings"
         element={
-          <ProtectedRoute allowedRoles={["admin"]}>
+          <ProtectedRoute module="settings" allowedRoles={["admin"]}>
             <Settings />
           </ProtectedRoute>
         }
@@ -165,8 +177,18 @@ function AppRoutes() {
       <Route
         path="/einvoicing"
         element={
-          <ProtectedRoute allowedRoles={["admin", "finance"]}>
+          <ProtectedRoute module="einvoicing" allowedRoles={["admin", "finance"]}>
             <EInvoicing />
+          </ProtectedRoute>
+        }
+      />
+
+      {/* Admin Routes */}
+      <Route
+        path="/admin/roles"
+        element={
+          <ProtectedRoute requireAdmin>
+            <RoleManagement />
           </ProtectedRoute>
         }
       />
